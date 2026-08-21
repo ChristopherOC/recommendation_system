@@ -11,7 +11,7 @@ import logging
 # AZURE FUNCTION
 # ============================================================
 
-app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
+app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 
 # ============================================================

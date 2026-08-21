@@ -1,0 +1,3 @@
+azure-functions
+scikit-surprise==1.1.4
+numpy<2

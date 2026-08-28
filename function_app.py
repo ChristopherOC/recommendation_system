@@ -250,8 +250,16 @@ def predict_svd(
             )
         )
 
-    return score
+    # Ramène le score entre 0 et 1
+    score = max(
+        0.0,
+        min(
+            1.0,
+            score,
+        ),
+    )
 
+    return score
 
 # ============================================================
 # RECOMMANDATION

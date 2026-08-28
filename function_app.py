@@ -257,10 +257,7 @@ def predict_svd(
 # RECOMMANDATION
 # ============================================================
 
-def recommend_svd(
-    user_id,
-    n=5,
-):
+def recommend_svd(user_id, n=5):
 
     load_models()
 
@@ -291,37 +288,7 @@ def recommend_svd(
         reverse=True,
     )
 
-    top_predictions = predictions[:n]
-
-    scores = [
-        score
-        for _, score in top_predictions
-    ]
-
-    min_score = min(scores)
-    max_score = max(scores)
-
-    normalized = []
-
-    for article_id, score in top_predictions:
-
-        if max_score == min_score:
-            normalized_score = 1.0
-        else:
-            normalized_score = (
-                score - min_score
-            ) / (
-                max_score - min_score
-            )
-
-        normalized.append(
-            (
-                article_id,
-                normalized_score,
-            )
-        )
-
-    return normalized
+    return predictions[:n]
 
 
 # ============================================================

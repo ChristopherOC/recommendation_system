@@ -6,11 +6,8 @@ import os
 import json
 import logging
 import threading
+import numpy as np
 
-
-# ============================================================
-# AZURE FUNCTION
-# ============================================================
 
 app = func.FunctionApp(
     http_auth_level=func.AuthLevel.ANONYMOUS
@@ -21,13 +18,6 @@ app = func.FunctionApp(
 # CONFIGURATION
 # ============================================================
 
-# IMPORTANT :
-# On utilise os.getenv() et non os.environ[] pour éviter de faire
-# planter l'import de function_app.py si une variable manque.
-#
-# Les variables seront vérifiées seulement au moment où une
-# requête aura besoin des modèles.
-
 STORAGE_CONNECTION_STRING = os.getenv(
     "AZURE_STORAGE_CONNECTION_STRING"
 )
@@ -36,13 +26,9 @@ MODEL_CONTAINER = os.getenv(
     "MODEL_CONTAINER"
 )
 
-
-# Noms des blobs.
-# Ils peuvent être surchargés avec des variables d'environnement.
-
 SVD_BLOB_NAME = os.getenv(
     "SVD_BLOB_NAME",
-    "svd_model.pkl",
+    "svd_model_light.pkl",
 )
 
 SEEN_BLOB_NAME = os.getenv(
@@ -55,45 +41,29 @@ ARTICLE_IDS_BLOB_NAME = os.getenv(
     "article_ids.pkl",
 )
 
-
-# ============================================================
-# STOCKAGE TEMPORAIRE LOCAL
-# ============================================================
-
-# Azure Functions Linux autorise l'écriture dans /tmp.
-# Les modèles seront conservés ici tant que l'instance Azure
-# reste active.
-
 LOCAL_MODEL_DIR = "/tmp/models"
 
 
 # ============================================================
-# VARIABLES GLOBALES DES MODÈLES
+# VARIABLES GLOBALES
 # ============================================================
 
-# Les modèles ne sont PAS chargés au démarrage de la Function.
-# Ils seront chargés uniquement lors de la première requête.
-
-algo = None
+svd_model = None
 seen_by_user = None
 article_ids = None
-
-
-# Empêche deux requêtes simultanées de charger les modèles
-# en même temps lors du premier appel.
 
 model_load_lock = threading.Lock()
 
 
 # ============================================================
-# TÉLÉCHARGEMENT D'UN BLOB
+# TÉLÉCHARGEMENT BLOB
 # ============================================================
 
 def download_blob_if_needed(
     blob_service_client,
-    blob_name: str,
-    local_filename: str,
-) -> str:
+    blob_name,
+    local_filename,
+):
 
     os.makedirs(
         LOCAL_MODEL_DIR,
@@ -105,121 +75,75 @@ def download_blob_if_needed(
         local_filename,
     )
 
-    # Si le fichier est déjà présent sur l'instance Azure,
-    # inutile de le retélécharger.
-
     if os.path.exists(local_path):
-
         logging.info(
             "Fichier déjà présent localement : %s",
             local_path,
         )
-
         return local_path
 
-
     logging.info(
-        "Téléchargement du blob '%s' depuis le container '%s'",
+        "Téléchargement du blob '%s' depuis '%s'",
         blob_name,
         MODEL_CONTAINER,
     )
-
 
     blob_client = blob_service_client.get_blob_client(
         container=MODEL_CONTAINER,
         blob=blob_name,
     )
 
-
-    with open(local_path, "wb") as file:
-
+    with open(local_path, "wb") as f:
         stream = blob_client.download_blob()
-
-        stream.readinto(file)
-
+        stream.readinto(f)
 
     logging.info(
         "Téléchargement terminé : %s",
         local_path,
     )
 
-
     return local_path
 
 
 # ============================================================
-# CHARGEMENT LAZY DES MODÈLES
+# CHARGEMENT DES MODÈLES
 # ============================================================
 
 def load_models():
 
-    global algo
+    global svd_model
     global seen_by_user
     global article_ids
 
-
-    # Si tout est déjà chargé, on retourne immédiatement.
-
     if (
-        algo is not None
+        svd_model is not None
         and seen_by_user is not None
         and article_ids is not None
     ):
         return
 
-
-    # Empêche plusieurs chargements simultanés.
-
     with model_load_lock:
 
-
-        # Deuxième vérification après acquisition du lock.
-        # Une autre requête a peut-être terminé le chargement
-        # pendant qu'on attendait.
-
         if (
-            algo is not None
+            svd_model is not None
             and seen_by_user is not None
             and article_ids is not None
         ):
             return
 
-
-        logging.info(
-            "Début du chargement des modèles..."
-        )
-
-
-        # ====================================================
-        # VÉRIFICATION DE LA CONFIGURATION
-        # ====================================================
-
         if not STORAGE_CONNECTION_STRING:
-
             raise RuntimeError(
-                "La variable d'environnement "
-                "'AZURE_STORAGE_CONNECTION_STRING' "
-                "n'est pas définie."
+                "AZURE_STORAGE_CONNECTION_STRING manquant"
             )
-
 
         if not MODEL_CONTAINER:
-
             raise RuntimeError(
-                "La variable d'environnement "
-                "'MODEL_CONTAINER' "
-                "n'est pas définie."
+                "MODEL_CONTAINER manquant"
             )
 
-
-        # ====================================================
-        # CONNEXION À AZURE BLOB STORAGE
-        # ====================================================
-
         logging.info(
-            "Connexion à Azure Blob Storage..."
+            "Début du chargement des modèles"
         )
-
 
         blob_service_client = (
             BlobServiceClient.from_connection_string(
@@ -227,17 +151,11 @@ def load_models():
             )
         )
 
-
-        # ====================================================
-        # TÉLÉCHARGEMENT DES FICHIERS
-        # ====================================================
-
         svd_path = download_blob_if_needed(
             blob_service_client,
             SVD_BLOB_NAME,
-            "svd_model.pkl",
+            "svd_model_light.pkl",
         )
-
 
         seen_path = download_blob_if_needed(
             blob_service_client,
@@ -245,92 +163,111 @@ def load_models():
             "seen_articles.pkl",
         )
 
-
         article_ids_path = download_blob_if_needed(
             blob_service_client,
             ARTICLE_IDS_BLOB_NAME,
             "article_ids.pkl",
         )
 
-
-        # ====================================================
-        # CHARGEMENT DES PICKLES
-        # ====================================================
-
         logging.info(
-            "Chargement du modèle SVD..."
+            "Chargement du modèle SVD léger"
         )
 
-
-        with open(
-            svd_path,
-            "rb",
-        ) as f:
-
-            loaded_algo = pickle.load(f)
-
+        with open(svd_path, "rb") as f:
+            loaded_svd = pickle.load(f)
 
         logging.info(
-            "Chargement des articles déjà vus..."
+            "Chargement des articles vus"
         )
 
-
-        with open(
-            seen_path,
-            "rb",
-        ) as f:
-
-            loaded_seen_by_user = pickle.load(f)
-
+        with open(seen_path, "rb") as f:
+            loaded_seen = pickle.load(f)
 
         logging.info(
-            "Chargement de la liste des articles..."
+            "Chargement des IDs articles"
         )
 
-
-        with open(
-            article_ids_path,
-            "rb",
-        ) as f:
-
+        with open(article_ids_path, "rb") as f:
             loaded_article_ids = pickle.load(f)
 
-
-        # On affecte les variables globales seulement une fois
-        # que les trois chargements ont réussi.
-
-        algo = loaded_algo
-        seen_by_user = loaded_seen_by_user
+        svd_model = loaded_svd
+        seen_by_user = loaded_seen
         article_ids = loaded_article_ids
 
-
         logging.info(
-            "Modèles chargés avec succès : %d articles candidats",
-            len(article_ids),
+            "Tous les modèles sont chargés"
         )
+
+
+# ============================================================
+# PRÉDICTION SVD
+# ============================================================
+
+def predict_svd(
+    user_id,
+    article_id,
+):
+
+    mean = svd_model["global_mean"]
+
+    raw2inner_user = svd_model[
+        "raw2inner_user"
+    ]
+
+    raw2inner_item = svd_model[
+        "raw2inner_item"
+    ]
+
+    uid = raw2inner_user.get(
+        user_id
+    )
+
+    iid = raw2inner_item.get(
+        article_id
+    )
+
+    score = mean
+
+    if uid is not None:
+        score += float(
+            svd_model["bu"][uid]
+        )
+
+    if iid is not None:
+        score += float(
+            svd_model["bi"][iid]
+        )
+
+    if (
+        uid is not None
+        and iid is not None
+    ):
+
+        score += float(
+            np.dot(
+                svd_model["pu"][uid],
+                svd_model["qi"][iid],
+            )
+        )
+
+    return score
 
 
 # ============================================================
 # RECOMMANDATION
 # ============================================================
 
-def recommend_surprise(
+def recommend_svd(
     user_id,
     n=5,
 ):
 
-    # Sécurité supplémentaire :
-    # si la fonction est appelée directement, les modèles
-    # seront tout de même chargés.
-
     load_models()
-
 
     seen = seen_by_user.get(
         user_id,
         set(),
     )
-
 
     candidates = [
         article_id
@@ -338,32 +275,27 @@ def recommend_surprise(
         if article_id not in seen
     ]
 
-
     predictions = [
         (
             int(article_id),
-            float(
-                algo.predict(
-                    user_id,
-                    article_id,
-                ).est
+            predict_svd(
+                user_id,
+                article_id,
             ),
         )
         for article_id in candidates
     ]
-
 
     predictions.sort(
         key=lambda x: x[1],
         reverse=True,
     )
 
-
     return predictions[:n]
 
 
 # ============================================================
-# ROUTE HTTP
+# ROUTE RECOMMEND
 # ============================================================
 
 @app.route(
@@ -374,15 +306,9 @@ def recommend(
     req: func.HttpRequest,
 ) -> func.HttpResponse:
 
-
     logging.info(
         "Requête de recommandation reçue"
     )
-
-
-    # ========================================================
-    # PARAMÈTRES
-    # ========================================================
 
     user_id_raw = req.params.get(
         "user_id"
@@ -393,7 +319,6 @@ def recommend(
         "5",
     )
 
-
     if user_id_raw is None:
 
         return func.HttpResponse(
@@ -403,13 +328,11 @@ def recommend(
                         "Le paramètre 'user_id' "
                         "est requis"
                     )
-                },
-                ensure_ascii=False,
+                }
             ),
             status_code=400,
             mimetype="application/json",
         )
-
 
     try:
 
@@ -421,7 +344,6 @@ def recommend(
             n_raw
         )
 
-
     except ValueError:
 
         return func.HttpResponse(
@@ -431,13 +353,11 @@ def recommend(
                         "'user_id' et 'n' "
                         "doivent être des entiers"
                     )
-                },
-                ensure_ascii=False,
+                }
             ),
             status_code=400,
             mimetype="application/json",
         )
-
 
     if n <= 0 or n > 100:
 
@@ -448,48 +368,22 @@ def recommend(
                         "'n' doit être compris "
                         "entre 1 et 100"
                     )
-                },
-                ensure_ascii=False,
+                }
             ),
             status_code=400,
             mimetype="application/json",
         )
 
-
-    # ========================================================
-    # RECOMMANDATION
-    # ========================================================
-
     try:
 
-        logging.info(
-            "Vérification / chargement des modèles"
-        )
-
-
-        load_models()
-
-
-        logging.info(
-            "Génération des recommandations "
-            "pour user_id=%d, n=%d",
+        recommendations = recommend_svd(
             user_id,
             n,
         )
-
-
-        recommendations = recommend_surprise(
-            user_id,
-            n,
-        )
-
 
         result = {
-
             "user_id": user_id,
-
             "recommendations": [
-
                 {
                     "article_id": article_id,
                     "score": round(
@@ -497,19 +391,10 @@ def recommend(
                         4,
                     ),
                 }
-
                 for article_id, score
                 in recommendations
             ],
         }
-
-
-        logging.info(
-            "Recommandation terminée avec succès "
-            "pour user_id=%d",
-            user_id,
-        )
-
 
         return func.HttpResponse(
             json.dumps(
@@ -520,14 +405,11 @@ def recommend(
             mimetype="application/json",
         )
 
-
     except Exception as e:
 
         logging.exception(
-            "Erreur pendant le chargement des modèles "
-            "ou la génération des recommandations"
+            "Erreur pendant la recommandation"
         )
-
 
         return func.HttpResponse(
             json.dumps(
@@ -546,7 +428,7 @@ def recommend(
 
 
 # ============================================================
-# ROUTE DE DIAGNOSTIC
+# ROUTE HEALTH
 # ============================================================
 
 @app.route(
@@ -557,31 +439,23 @@ def health(
     req: func.HttpRequest,
 ) -> func.HttpResponse:
 
-
     result = {
-
         "status": "ok",
-
         "function_loaded": True,
-
         "storage_connection_configured": bool(
             STORAGE_CONNECTION_STRING
         ),
-
         "model_container_configured": bool(
             MODEL_CONTAINER
         ),
-
         "models_loaded": (
-            algo is not None
+            svd_model is not None
             and seen_by_user is not None
             and article_ids is not None
         ),
-
         "model_container": MODEL_CONTAINER,
-
+        "svd_blob": SVD_BLOB_NAME,
     }
-
 
     return func.HttpResponse(
         json.dumps(
